@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-SDN DDoS Detection & Mitigation Controller – ULTIMATE EDITION
 - LAYER 2 MITIGATION: Khóa bằng MAC, truy ngược ra IP để hiển thị lên Dashboard.
 - QUEUE BACKLOG FIX: Vứt bỏ gói tin cũ tồn đọng nếu MAC đã bị block.
 - PINGALL FIX 2.0 (SMART): Lọc Pingall bằng "Độ tập trung lưu lượng" thay vì đếm gói tin cứng.

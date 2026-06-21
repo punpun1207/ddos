@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-SDN DDoS Detection & Mitigation Controller – LAYER 2 MITIGATION
-- Chế độ Độc tài: Threshold quyết định, DNN làm cố vấn.
-- Nâng cấp: Truy tìm và khóa chặn bằng địa chỉ MAC (Layer 2) để hủy diệt hoàn toàn IP Spoofing.
-- FIX: Bỏ qua gói tin từ IP đã block để Attack Stats không tăng.
+SDN DDoS Detection & Mitigation Controller – ULTIMATE EDITION
+- LAYER 2 MITIGATION: Khóa bằng MAC, truy ngược ra IP để hiển thị lên Dashboard.
+- QUEUE BACKLOG FIX: Vứt bỏ gói tin cũ tồn đọng nếu MAC đã bị block.
+- PINGALL FIX 2.0 (SMART): Lọc Pingall bằng "Độ tập trung lưu lượng" thay vì đếm gói tin cứng.
+- SILENT MODE: Tự viết lại L2 Switch, tắt log 'packet in' làm nhiễu Terminal.
+- BROADCAST STORM FIX: Copy luồng bằng Flow Actions thay vì Override Priority.
+- THRESHOLD DECAY FIX: Đặt mức Sàn tối thiểu và chọn Thủ phạm chiếm tỷ lệ cao nhất.
 """
 
 import os
+import warnings
+warnings.filterwarnings('ignore')
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' # Tắt toàn bộ cảnh báo của TensorFlow
+
 import math
 import time
 import json
@@ -21,32 +28,27 @@ from ryu.lib import hub
 from ryu.app.simple_switch_13 import SimpleSwitch13
 from ryu.lib.packet import packet, ethernet, ipv4, tcp, udp, icmp
 
-# -------------------- CONFIG --------------------
 WINDOW_SEC      = 3
 API_PORT        = 5001
-BLOCK_DURATION  = 10
+BLOCK_DURATION  = 20
 RATE_LIMIT_KBPS = 2000
 METER_ID        = 100
 HISTORY_LEN     = 200
 ALERT_HISTORY   = 100
-
 ALPHA = 0.85
 
 ATTACK_NAMES = {0:'Normal',1:'TCP SYN Flood',2:'UDP Flood',3:'ICMP Flood',4:'TCP ACK Flood'}
 _KEY_MAP = {1:'tcp_syn',2:'udp',3:'icmp',4:'tcp_ack'}
 
 def shannon_entropy(lst):
-    if not lst:
-        return 0.0
+    if not lst: return 0.0
     freq = {}
-    for x in lst:
-        freq[x] = freq.get(x,0)+1
+    for x in lst: freq[x] = freq.get(x,0)+1
     n = len(lst)
     return -sum((c/n)*math.log2(c/n) for c in freq.values())
 
 def calc_confidence(ratio, threshold):
-    if ratio <= threshold:
-        return 0.0
+    if ratio <= threshold: return 0.0
     return min(1.0, 0.5 + 0.5*(ratio-threshold)/threshold)
 
 class SimpleMonitor13(SimpleSwitch13):
@@ -62,6 +64,7 @@ class SimpleMonitor13(SimpleSwitch13):
         self.window_dst_list = []
         self.window_mac_list = []
         self.ip_to_mac = {}
+        self.mac_to_port = {}  # Dùng cho tự định tuyến L2
 
         self.window_packets = 0
         self.window_bytes = 0
@@ -90,7 +93,7 @@ class SimpleMonitor13(SimpleSwitch13):
         self.alert_history = deque(maxlen=ALERT_HISTORY)
         self.timeseries = deque(maxlen=HISTORY_LEN)
 
-        # DNN (optional)
+        # Cố gắng nạp mô hình DNN
         self.dnn_model = None
         self.scaler = None
         self.use_dnn = False
@@ -100,7 +103,7 @@ class SimpleMonitor13(SimpleSwitch13):
                 self.dnn_model = keras.models.load_model("ddos_dnn.h5", compile=False)
                 self.scaler = joblib.load("scaler_dnn.pkl")
                 self.use_dnn = True
-                self.logger.info("✅ DNN loaded")
+                self.logger.info("✅ DNN model loaded successfully.")
         except Exception as e:
             self.logger.warning(f"DNN load failed: {e}")
 
@@ -132,32 +135,75 @@ class SimpleMonitor13(SimpleSwitch13):
             self.datapaths.pop(dp.id, None)
             self.logger.info("Switch %016x disconnected", dp.id)
 
+    # =========================================================================
+    # SILENT PACKET_IN HANDLER & SMART MIRRORING
+    # =========================================================================
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
-        try:
-            super()._packet_in_handler(ev)
-        except: pass
+        msg = ev.msg
+        dp = msg.datapath
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
+        in_port = msg.match['in_port']
+        reason = msg.reason
 
+        pkt = packet.Packet(msg.data)
+        eth_list = pkt.get_protocols(ethernet.ethernet)
+        if not eth_list: return
+        eth = eth_list[0]
+
+        if eth.ethertype == 0x88cc:  # Bỏ qua LLDP
+            return
+
+        dst = eth.dst
+        src = eth.src
+        dpid = dp.id
+
+        # 1. Tự chuyển mạch Lớp 2 (Chỉ tạo luật khi Switch chưa biết đường đi - NO_MATCH)
+        if reason == ofp.OFPR_NO_MATCH:
+            if not hasattr(self, 'mac_to_port'):
+                self.mac_to_port = {}
+            self.mac_to_port.setdefault(dpid, {})
+            self.mac_to_port[dpid][src] = in_port
+
+            if dst in self.mac_to_port[dpid]:
+                out_port = self.mac_to_port[dpid][dst]
+            else:
+                out_port = ofp.OFPP_FLOOD
+
+            # BẢN VÁ QUAN TRỌNG: Vừa cho gói tin đi tiếp, vừa copy 1 bản lên AI Controller
+            flow_actions = [parser.OFPActionOutput(out_port), parser.OFPActionOutput(ofp.OFPP_CONTROLLER)]
+
+            if out_port != ofp.OFPP_FLOOD:
+                match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
+                if msg.buffer_id != ofp.OFP_NO_BUFFER:
+                    self.add_flow(dp, 1, match, flow_actions, msg.buffer_id)
+                else:
+                    self.add_flow(dp, 1, match, flow_actions)
+
+            # Chuyển tiếp gói tin đầu tiên đi
+            out_actions = [parser.OFPActionOutput(out_port)]
+            data = msg.data if msg.buffer_id == ofp.OFP_NO_BUFFER else None
+            out = parser.OFPPacketOut(datapath=dp, buffer_id=msg.buffer_id,
+                                      in_port=in_port, actions=out_actions, data=data)
+            dp.send_msg(out)
+
+        # 2. CHỐNG "BÓNG MA HÀNG ĐỢI": Bỏ qua phân tích nếu MAC này đang bị Block
+        if src in self.blocked_macs and time.time() < self.blocked_macs[src]:
+            return
+
+        # 3. Thu thập dữ liệu cho AI (Phân tích cả gói NO_MATCH và gói copy ACTION)
         try:
-            pkt = packet.Packet(ev.msg.data)
-            eth = pkt.get_protocol(ethernet.ethernet)
-            if not eth or eth.ethertype != 0x0800:
-                return
             ip_pkt = pkt.get_protocol(ipv4.ipv4)
-            if not ip_pkt:
-                return
+            if not ip_pkt: return
 
             src_ip = ip_pkt.src
             dst_ip = ip_pkt.dst
             mac_src = eth.src
             proto = ip_pkt.proto
 
-            # FIX: Nếu IP đã bị block, bỏ qua (không xử lý)
-            if src_ip in self.blocked_ips:
-                return
-
             self.window_packets += 1
-            self.window_bytes += len(ev.msg.data)
+            self.window_bytes += len(msg.data)
             self.window_src_list.append(src_ip)
             self.window_dst_list.append(dst_ip)
             self.window_mac_list.append(mac_src)
@@ -210,30 +256,62 @@ class SimpleMonitor13(SimpleSwitch13):
         icmp_cnt = self.window_icmp_cnt
         self._reset_window()
 
-        if pkts == 0:
-            return
+        if pkts == 0: return
+
+        # ---------------------------------------------------------------------
+        # KIỂM TRA NẠN NHÂN VÀ ĐỘ TẬP TRUNG LƯU LƯỢNG (TRAFFIC CONCENTRATION)
+        # ---------------------------------------------------------------------
+        dst_freq = defaultdict(int)
+        for ip in dst_list: dst_freq[ip] += 1
+        
+        victim = max(dst_freq, key=dst_freq.get) if dst_freq else "unknown"
+        max_dst_count = dst_freq[victim] if victim != "unknown" else 0
+        
+        # victim_ratio: Nạn nhân lớn nhất đang hứng chịu bao nhiêu % lưu lượng mạng?
+        victim_ratio = max_dst_count / max(pkts, 1)
 
         syn_ratio = syn_cnt / max(tcp_total, 1)
         ack_ratio = ack_cnt / max(tcp_total, 1)
-        udp_ratio = udp_cnt / max(total_flows, 1)
+        udp_ratio = udp_cnt / max(pkts, 1)
         icmp_ratio = icmp_cnt / max(pkts, 1)
         ent_src = shannon_entropy(src_list)
         ent_dst = shannon_entropy(dst_list)
 
-        thr_syn_adapt  = min(0.95, self.baseline_syn_ratio * 2.0)
-        thr_ack_adapt  = min(0.95, self.baseline_ack_ratio * 2.0)
-        thr_udp_adapt  = min(0.95, self.baseline_udp_ratio * 2.5)
-        thr_icmp_adapt = min(0.95, self.baseline_icmp_ratio * 3.0)
+        # BẢN VÁ THÔNG MINH: Lọc Pingall và Traffic rác
+        if pkts < 100 or victim_ratio < 0.3:
+            self._update_baseline(ent_src, ent_dst, syn_ratio, ack_ratio, udp_ratio, icmp_ratio)
+            if pkts >= 50:
+                print(f"[{time.strftime('%H:%M:%S')}] ✅ Traffic legitimate! (Tải: {pkts} pkts, Mức độ tập trung: {victim_ratio*100:.1f}%)")
+            return
+
+        # ====================================================================
+        # BẢN VÁ: CHỐNG SUY BIẾN NGƯỠNG (THRESHOLD DECAY) & KẸT LỆNH IF
+        # ====================================================================
+        # 1. Đặt mức SÀN cứng (Floor) để AI không quá nhạy cảm khi mạng rảnh rỗi.
+        # Ngay cả khi baseline tụt về 0, SYN/ACK phải chiếm tối thiểu >40%, UDP >20%, ICMP >10%
+        thr_syn_adapt  = max(0.40, min(0.95, self.baseline_syn_ratio * 2.0))
+        thr_ack_adapt  = max(0.40, min(0.95, self.baseline_ack_ratio * 2.0))
+        thr_udp_adapt  = max(0.20, min(0.95, self.baseline_udp_ratio * 2.5))
+        thr_icmp_adapt = max(0.10, min(0.95, self.baseline_icmp_ratio * 3.0))
+
+        # 2. Loại bỏ lệnh if/elif tuần tự. So sánh tất cả các giao thức.
+        candidates = []
+        if icmp_ratio > thr_icmp_adapt:
+            candidates.append((3, calc_confidence(icmp_ratio, thr_icmp_adapt), icmp_ratio))
+        if udp_ratio > thr_udp_adapt:
+            candidates.append((2, calc_confidence(udp_ratio, thr_udp_adapt), udp_ratio))
+        if syn_ratio > thr_syn_adapt:
+            candidates.append((1, calc_confidence(syn_ratio, thr_syn_adapt), syn_ratio))
+        if ack_ratio > thr_ack_adapt:
+            candidates.append((4, calc_confidence(ack_ratio, thr_ack_adapt), ack_ratio))
 
         thr_attack, thr_conf = 0, 0.0
-        if icmp_ratio > thr_icmp_adapt:
-            thr_attack, thr_conf = 3, calc_confidence(icmp_ratio, thr_icmp_adapt)
-        elif udp_ratio > thr_udp_adapt:
-            thr_attack, thr_conf = 2, calc_confidence(udp_ratio, thr_udp_adapt)
-        elif syn_ratio > thr_syn_adapt:
-            thr_attack, thr_conf = 1, calc_confidence(syn_ratio, thr_syn_adapt)
-        elif ack_ratio > thr_ack_adapt:
-            thr_attack, thr_conf = 4, calc_confidence(ack_ratio, thr_ack_adapt)
+        if candidates:
+            # 3. Chọn giao thức vi phạm có tỷ lệ (ratio) CAO NHẤT làm thủ phạm chính
+            best_attack = max(candidates, key=lambda item: item[2])
+            thr_attack = best_attack[0]
+            thr_conf = best_attack[1]
+        # ====================================================================
 
         dnn_attack, dnn_conf = 0, 0.0
         if self.use_dnn and self.dnn_model is not None:
@@ -243,8 +321,7 @@ class SimpleMonitor13(SimpleSwitch13):
                 features_scaled = self.scaler.transform(features)
                 proba = self.dnn_model.predict(features_scaled, verbose=0)[0]
                 dnn_attack, dnn_conf = int(np.argmax(proba)), float(np.max(proba))
-            except:
-                pass
+            except: pass
 
         if thr_attack != 0:
             attack_type, confidence, used = thr_attack, thr_conf, "threshold"
@@ -263,17 +340,11 @@ class SimpleMonitor13(SimpleSwitch13):
             self.total_ddos += 1
 
         ts_entry = {'ts': round(time.time(),1), 'attack': attack_type, 'confidence': round(confidence,3)}
-        with self._lock:
-            self.timeseries.append(ts_entry)
+        with self._lock: self.timeseries.append(ts_entry)
 
-        # Victim
-        dst_freq = defaultdict(int)
-        for ip in dst_list:
-            dst_freq[ip] += 1
-        victim = max(dst_freq, key=dst_freq.get) if dst_freq else "unknown"
         victim_mac = self.ip_to_mac.get(victim, "unknown")
 
-        # Attacker MACs
+        # Xác định Kẻ tấn công (Gom toàn bộ MAC vi phạm)
         mac_freq = defaultdict(int)
         for mac in mac_list:
             mac_freq[mac] += 1
@@ -296,8 +367,7 @@ class SimpleMonitor13(SimpleSwitch13):
             'id': self.alert_id, 'timestamp': round(time.time(),1),
             'victim': victim, 'attack_type': attack_type,
             'attack_name': ATTACK_NAMES[attack_type],
-            'confidence': round(confidence,3),
-            'attacker_macs': attacker_macs,
+            'confidence': round(confidence,3), 'attacker_macs': attacker_macs,
             'method': used
         }
         with self._lock:
@@ -343,25 +413,33 @@ class SimpleMonitor13(SimpleSwitch13):
         elif atype == 3:
             self._drop_proto_to(victim, ip_proto=1)
 
-        self.logger.info(f"Mitigation | {ATTACK_NAMES[atype]} | Blocked MACs: {attacker_macs}")
-
     def _block_mac(self, mac, duration=BLOCK_DURATION):
         self.blocked_macs[mac] = time.time() + duration
 
-        # Tìm IP từ MAC
-        ip = None
+        # Tìm IP đại diện cho MAC để hiển thị lên Dashboard & CAPTCHA
+        spoofed_ips = []
         for src_ip, src_mac in self.ip_to_mac.items():
             if src_mac == mac:
-                ip = src_ip
-                break
+                spoofed_ips.append(src_ip)
 
-        if ip and ip not in self.whitelist:
-            self.blocked_ips[ip] = time.time() + duration
-            self.logger.warning(f"✅ Added IP {ip} to blocked_ips")
+        display_ip = None
+        if spoofed_ips:
+             display_ip = spoofed_ips[0]
+        elif self.window_src_list:
+             display_ip = self.window_src_list[0]
+
+        if display_ip and display_ip not in self.whitelist:
+            if len(spoofed_ips) > 1:
+                display_label = f"{display_ip} (và {len(spoofed_ips)-1} IP giả mạo)"
+            else:
+                display_label = display_ip
+                
+            self.blocked_ips[display_ip] = time.time() + duration
+            self.logger.warning(f"✅ Phát hiện MAC {mac} sử dụng {len(spoofed_ips)} IP: {display_label}")
         else:
             self.logger.warning(f"⚠️ Could not add IP for MAC {mac}")
 
-        # Block MAC
+        # Hạ búa Lớp 2 xuống OVS
         for dp in list(self.datapaths.values()):
             ofp, par = dp.ofproto, dp.ofproto_parser
             match = par.OFPMatch(eth_src=mac)
@@ -371,18 +449,31 @@ class SimpleMonitor13(SimpleSwitch13):
                 instructions=inst, hard_timeout=duration,
                 command=ofp.OFPFC_ADD
             ))
-        self.logger.warning(f"🔒 Blocked MAC {mac} for {duration}s" + (f" (IP: {ip})" if ip else ""))
+        self.logger.warning(f"🔒 Blocked MAC {mac} for {duration}s" + (f" (IP: {display_ip})" if display_ip else ""))
 
     def _unblock_ip(self, ip):
         self.blocked_ips.pop(ip, None)
-        for dp in list(self.datapaths.values()):
-            ofp, par = dp.ofproto, dp.ofproto_parser
-            match = par.OFPMatch(eth_type=0x0800, ipv4_src=ip)
-            dp.send_msg(par.OFPFlowMod(
-                datapath=dp, priority=200, match=match,
-                command=ofp.OFPFC_DELETE,
-                out_port=ofp.OFPP_ANY, out_group=ofp.OFPG_ANY
-            ))
+        
+        # Ánh xạ từ IP về lại MAC để gỡ đúng luật Lớp 2
+        target_mac = None
+        for src_ip, src_mac in list(self.ip_to_mac.items()):
+            if src_ip == ip:
+                target_mac = src_mac
+                break
+                
+        if target_mac:
+            self.blocked_macs.pop(target_mac, None)
+            for dp in list(self.datapaths.values()):
+                ofp, par = dp.ofproto, dp.ofproto_parser
+                match = par.OFPMatch(eth_src=target_mac)
+                dp.send_msg(par.OFPFlowMod(
+                    datapath=dp, priority=250, match=match,
+                    command=ofp.OFPFC_DELETE,
+                    out_port=ofp.OFPP_ANY, out_group=ofp.OFPG_ANY
+                ))
+            self.logger.info(f"🔓 Đã gỡ Block MAC {target_mac} qua yêu cầu Unblock IP {ip}")
+        else:
+            self.logger.warning(f"⚠️ Không tìm thấy MAC cho IP {ip} để gỡ block!")
 
     def _unblock_mac(self, mac):
         self.blocked_macs.pop(mac, None)
@@ -479,11 +570,6 @@ class SimpleMonitor13(SimpleSwitch13):
         def pending():
             with self._lock:
                 return jsonify(list(self.pending_alerts))
-
-        @app.route('/alerts/history')
-        def alert_history():
-            with self._lock:
-                return jsonify(list(self.alert_history))
 
         @app.route('/approve/<int:aid>', methods=['POST'])
         def approve(aid):

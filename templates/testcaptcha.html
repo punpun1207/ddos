@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🔐 Xác minh an toàn</title>
+    <style>
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1e1e2f, #2d2d44);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: #eee;
+        }
+        .container {
+            background: #2d2d44;
+            padding: 40px;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+            max-width: 480px;
+            width: 90%;
+            text-align: center;
+        }
+        h1 {
+            font-size: 2rem;
+            margin-bottom: 10px;
+        }
+        .subtitle {
+            color: #aaa;
+            margin-bottom: 30px;
+            font-size: 0.95rem;
+        }
+        .captcha-box {
+            background: #1e1e2f;
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 25px;
+            font-size: 2.5rem;
+            font-weight: bold;
+            letter-spacing: 8px;
+            color: #4caf50;
+            font-family: 'Courier New', monospace;
+            border: 2px dashed #4caf50;
+            user-select: none;
+        }
+        input[type="text"] {
+            width: 80%;
+            padding: 14px 20px;
+            border: none;
+            border-radius: 30px;
+            background: #1e1e2f;
+            color: #eee;
+            font-size: 1.1rem;
+            text-align: center;
+            outline: 2px solid #4c6ef5;
+            transition: 0.3s;
+        }
+        input[type="text"]:focus {
+            outline: 2px solid #4caf50;
+        }
+        button {
+            margin-top: 20px;
+            padding: 14px 40px;
+            border: none;
+            border-radius: 30px;
+            background: #4c6ef5;
+            color: white;
+            font-size: 1.1rem;
+            font-weight: bold;
+            cursor: pointer;
+            transition: 0.3s;
+        }
+        button:hover {
+            background: #3b5de7;
+            transform: scale(1.02);
+        }
+        .error {
+            color: #f44336;
+            margin-top: 15px;
+            font-weight: bold;
+        }
+        .info {
+            color: #aaa;
+            font-size: 0.85rem;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 Xác minh bảo mật</h1>
+        <p class="subtitle">Vui lòng nhập mã CAPTCHA để tiếp tục</p>
+        <div class="captcha-box">{{ code }}</div>
+        <form method="POST">
+            <input type="text" name="captcha" placeholder="Nhập mã..." autofocus required>
+            <br>
+            <button type="submit">Xác minh</button>
+        </form>
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+        <div class="info">Mã có hiệu lực trong 2 phút</div>
+    </div>
+</body>
+</html>

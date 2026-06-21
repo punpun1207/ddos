@@ -1,145 +1,172 @@
 #!/usr/bin/env python3
-# collect_multi.py - Thu thập 12 đặc trưng, label 0..4
+"""
+multi_collect.py - Thu thập dữ liệu huấn luyện thủ công
+Chạy trên victim host (ví dụ h1) trong Mininet.
 
+Cách dùng:
+1. Trong Mininet: h1 python3 multi_collect.py --output train.csv --label 0 --duration 60
+2. Trong khi collector chạy, hãy thực hiện tấn công từ attacker (h2, h3,...) với loại tương ứng.
+3. Collector sẽ tự động ghi mỗi cửa sổ 3 giây vào file CSV.
+
+Các label:
+0 = Normal (không tấn công)
+1 = TCP SYN Flood
+2 = UDP Flood
+3 = ICMP Flood
+4 = TCP ACK Flood
+"""
+
+import time
+import argparse
+import csv
 import os
-import psutil
-import numpy as np
+import math
+import threading
 from collections import defaultdict
-from ryu.controller import ofp_event
-from ryu.controller.handler import MAIN_DISPATCHER, DEAD_DISPATCHER, set_ev_cls
-from ryu.lib import hub
-import newswitch as switch
+from scapy.all import sniff, IP, TCP, UDP, ICMP
 
 WINDOW_SEC = 3
-OUTPUT_CSV = "ddos_multi.csv"
-
-FEATURE_COLS = [
-    'SSIP','SDFP','SDFB','SFE','NIFE',
-    'SYN_ratio','ACK_ratio','UDP_ratio','ICMP_ratio',
-    'Pkt_rate','Byte_rate','entropy_src','entropy_dst','label'
+FEATURE_NAMES = [
+    'pkt_rate', 'byte_rate', 'flow_rate',
+    'ent_src', 'ent_dst',
+    'syn_ratio', 'ack_ratio', 'udp_ratio', 'icmp_ratio'
 ]
 
-if not os.path.exists(OUTPUT_CSV):
-    with open(OUTPUT_CSV, 'w') as f:
-        f.write(','.join(FEATURE_COLS) + '\n')
+class TrafficCollector:
+    def __init__(self, output_file, duration):
+        self.output_file = output_file
+        self.duration = duration
+        self.stop_flag = False
+        self.lock = threading.Lock()
+        self.reset_window()
 
-def shannon_entropy(lst):
-    if not lst:
-        return 0.0
-    _, counts = np.unique(lst, return_counts=True)
-    probs = counts / len(lst)
-    return -np.sum(probs * np.log2(probs))
+        # Ghi header nếu file mới
+        if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
+            with open(output_file, 'w') as f:
+                writer = csv.writer(f)
+                writer.writerow(FEATURE_NAMES + ['label'])
 
-def detect_attack_type():
-    """Duyệt tiến trình hping3 để xác định loại tấn công"""
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-        try:
-            if proc.info['name'] and 'hping3' in proc.info['name'].lower():
-                cmd = ' '.join(proc.info['cmdline'] or []).lower()
-                if ' -s ' in cmd or ' --syn' in cmd:
-                    return 1   # SYN flood
-                if ' -2 ' in cmd or ' --udp' in cmd:
-                    return 2   # UDP flood
-                if ' -1 ' in cmd or ' --icmp' in cmd:
-                    return 3   # ICMP flood
-                if ' -a ' in cmd or ' --ack' in cmd:
-                    return 4   # ACK flood
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-    return 0   # normal
+    def reset_window(self):
+        self.pkts = 0
+        self.bytes = 0
+        self.src_ips = []
+        self.dst_ips = []
+        self.flows = set()
+        self.tcp_total = 0
+        self.syn_cnt = 0
+        self.ack_cnt = 0
+        self.udp_cnt = 0
+        self.icmp_cnt = 0
+        self.start_time = time.time()
 
-class MultiCollector(switch.SimpleSwitch13):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.datapaths = {}
-        self.prev_flows = set()
-        self.sample_count = 0
-        self.monitor_thread = hub.spawn(self._monitor)
-
-    @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
-    def _state_change_handler(self, ev):
-        dp = ev.datapath
-        if ev.state == MAIN_DISPATCHER:
-            self.datapaths[dp.id] = dp
-        elif ev.state == DEAD_DISPATCHER and dp.id in self.datapaths:
-            del self.datapaths[dp.id]
-
-    def _monitor(self):
-        while True:
-            for dp in self.datapaths.values():
-                dp.send_msg(dp.ofproto_parser.OFPFlowStatsRequest(dp))
-            hub.sleep(WINDOW_SEC)
-
-    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
-    def _flow_stats_reply_handler(self, ev):
-        src_ips, dst_ips = [], []
-        pkt_counts, byte_counts = [], []
-        tcp_total = syn_cnt = ack_cnt = 0
-        udp_cnt = icmp_cnt = 0
-        flows_this = set()
-        interactions = set()
-        total_pkts = total_bytes = 0
-
-        for st in ev.msg.body:
-            if st.priority != 1:
-                continue
-            m = st.match
-            ip_src = m.get('ipv4_src')
-            ip_dst = m.get('ipv4_dst')
-            proto = m.get('ip_proto')
-            if not (ip_src and ip_dst and proto):
-                continue
-            tp_src = m.get('tcp_src') or m.get('udp_src') or 0
-            tp_dst = m.get('tcp_dst') or m.get('udp_dst') or 0
-            fid = f"{ip_src}-{tp_src}-{ip_dst}-{tp_dst}-{proto}"
-            flows_this.add(fid)
-            interactions.add((ip_src, tp_src, ip_dst, tp_dst, proto))
-            src_ips.append(ip_src)
-            dst_ips.append(ip_dst)
-            pkt_counts.append(st.packet_count)
-            byte_counts.append(st.byte_count)
-            total_pkts += st.packet_count
-            total_bytes += st.byte_count
-
-            if proto == 6:
-                tcp_total += 1
-                flags = m.get('tcp_flags', 0)
-                if flags & 0x02:
-                    syn_cnt += 1
-                if flags & 0x10:
-                    ack_cnt += 1
-            elif proto == 17:
-                udp_cnt += 1
-            elif proto == 1:
-                icmp_cnt += 1
-
-        if not pkt_counts:
+    def packet_handler(self, pkt):
+        if self.stop_flag:
             return
+        if not pkt.haslayer(IP):
+            return
+        ip = pkt[IP]
+        src = ip.src
+        dst = ip.dst
+        proto = ip.proto
+        size = len(pkt)
 
-        ssip = len(set(src_ips))
-        sdfp = np.std(pkt_counts) if len(pkt_counts) > 1 else 0.0
-        sdfb = np.std(byte_counts) if len(byte_counts) > 1 else 0.0
-        sfe = len(flows_this - self.prev_flows)
-        self.prev_flows = flows_this
-        pair_cnt = sum(1 for (a1,p1,a2,p2,pr) in interactions if (a2,p2,a1,p1,pr) in interactions)
-        nife = pair_cnt / max(sfe, 1)
+        with self.lock:
+            self.pkts += 1
+            self.bytes += size
+            self.src_ips.append(src)
+            self.dst_ips.append(dst)
 
-        total_flows = len(pkt_counts)
-        syn_ratio = syn_cnt / max(tcp_total, 1)
-        ack_ratio = ack_cnt / max(tcp_total, 1)
-        udp_ratio = udp_cnt / max(total_flows, 1)
-        icmp_ratio = icmp_cnt / max(total_flows, 1)
-        pkt_rate = total_pkts / WINDOW_SEC
-        byte_rate = total_bytes / WINDOW_SEC
-        ent_src = shannon_entropy(src_ips)
-        ent_dst = shannon_entropy(dst_ips)
+            if proto == 6 and pkt.haslayer(TCP):
+                tcp = pkt[TCP]
+                self.tcp_total += 1
+                # SYN flag (bit 1)
+                if tcp.flags & 0x02:
+                    self.syn_cnt += 1
+                # ACK flag (bit 4)
+                if tcp.flags & 0x10:
+                    self.ack_cnt += 1
+                fid = f"{src}-{tcp.sport}-{dst}-{tcp.dport}-6"
+                self.flows.add(fid)
+            elif proto == 17 and pkt.haslayer(UDP):
+                udp = pkt[UDP]
+                self.udp_cnt += 1
+                fid = f"{src}-{udp.sport}-{dst}-{udp.dport}-17"
+                self.flows.add(fid)
+            elif proto == 1:
+                self.icmp_cnt += 1
+                fid = f"{src}-0-{dst}-0-1"
+                self.flows.add(fid)
+            else:
+                fid = f"{src}-0-{dst}-0-{proto}"
+                self.flows.add(fid)
 
-        label = detect_attack_type()
+    def compute_features(self):
+        total_flows = len(self.flows)
+        tcp_total = self.tcp_total
+        pkt_rate = self.pkts / WINDOW_SEC
+        byte_rate = self.bytes / WINDOW_SEC
+        flow_rate = total_flows / WINDOW_SEC
 
-        with open(OUTPUT_CSV, 'a') as f:
-            row = [ssip, sdfp, sdfb, sfe, nife,
-                   syn_ratio, ack_ratio, udp_ratio, icmp_ratio,
-                   pkt_rate, byte_rate, ent_src, ent_dst, label]
-            f.write(','.join(str(x) for x in row) + '\n')
-        self.sample_count += 1
-        print(f"Collected {self.sample_count}, label={label}")
+        # Entropy src/dst
+        src_freq = defaultdict(int)
+        for ip in self.src_ips:
+            src_freq[ip] += 1
+        dst_freq = defaultdict(int)
+        for ip in self.dst_ips:
+            dst_freq[ip] += 1
+
+        def entropy(freq_dict):
+            n = sum(freq_dict.values())
+            if n == 0:
+                return 0.0
+            return -sum((c / n) * math.log2(c / n) for c in freq_dict.values())
+
+        ent_src = entropy(src_freq)
+        ent_dst = entropy(dst_freq)
+
+        syn_ratio = self.syn_cnt / max(tcp_total, 1)
+        ack_ratio = self.ack_cnt / max(tcp_total, 1)
+        udp_ratio = self.udp_cnt / max(total_flows, 1)
+        icmp_ratio = self.icmp_cnt / max(self.pkts, 1)
+
+        return [pkt_rate, byte_rate, flow_rate, ent_src, ent_dst,
+                syn_ratio, ack_ratio, udp_ratio, icmp_ratio]
+
+    def run(self, label):
+        print(f"[+] Starting collector for label {label} (duration {self.duration}s)")
+        # Sniff in background thread
+        sniff_thread = threading.Thread(target=lambda: sniff(prn=self.packet_handler, store=False, timeout=self.duration))
+        sniff_thread.start()
+
+        start = time.time()
+        last_window = start
+        while time.time() - start < self.duration and not self.stop_flag:
+            now = time.time()
+            if now - last_window >= WINDOW_SEC:
+                with self.lock:
+                    features = self.compute_features()
+                    self.reset_window()
+                # Write to CSV
+                with open(self.output_file, 'a') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(features + [label])
+                print(f"[+] Window recorded: label={label}, pkt_rate={features[0]:.2f}, pkts={self.pkts}")
+                last_window = now
+            time.sleep(0.1)
+
+        sniff_thread.join()
+        print(f"[+] Collection finished for label {label}")
+
+def main():
+    parser = argparse.ArgumentParser(description='Collect training data from live network traffic')
+    parser.add_argument('--output', default='training_data.csv', help='Output CSV file')
+    parser.add_argument('--duration', type=int, default=60, help='Duration per label (seconds)')
+    parser.add_argument('--label', type=int, required=True, choices=[0,1,2,3,4],
+                        help='Label (0=Normal,1=SYN,2=UDP,3=ICMP,4=ACK)')
+    args = parser.parse_args()
+
+    collector = TrafficCollector(args.output, args.duration)
+    collector.run(args.label)
+
+if __name__ == '__main__':
+    main()
